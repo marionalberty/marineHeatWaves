@@ -129,6 +129,13 @@ def detect(temp, climatologyPeriod=[None,None], pctile=0.9, smoothPercentile=Tru
     '''
 
     #
+    # Ensure data array is loaded into memory
+    #
+    
+    temp = temp.load()
+    
+    
+    #
     # Initialize MHW output variable
     #
 
