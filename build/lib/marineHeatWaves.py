@@ -6,26 +6,26 @@
 '''
 
 
+import math
 import numpy as np
+import scipy.ndimage as ndimage
+import cftime
 import scipy as sp
 from scipy import linalg
 from scipy import stats
-import scipy.ndimage as ndimage
 from datetime import date
 
 
-def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5, smoothPercentile=True, smoothPercentileWidth=31, minDuration=5, joinAcrossGaps=True, maxGap=2, maxPadLength=False, coldSpells=False, alternateClimatology=False):
+def detect(temp, climatologyPeriod=[None,None], pctile=0.9, smoothPercentile=True, smoothPercentileWidth=31, minDuration=5, joinAcrossGaps=True, maxGap=2, coldSpells=False, alternateClimatology=False):
     '''
 
     Applies the Hobday et al. (2016) marine heat wave definition to an input time
-    series of temp ('temp') along with a time vector ('t'). Outputs properties of
-    all detected marine heat waves.
+    series of temp ('temp') that is an xarray data array with demensions 'time'.
+    Outputs properties of all detected marine heat waves.
 
     Inputs:
 
-      t       Time vector, in datetime format (e.g., date(1982,1,1).toordinal())
-              [1D numpy array of length T]
-      temp    Temperature vector [1D numpy array of length T]
+      temp    Temperature xarray data array [1D array with dimensions 'time' of length T]
 
     Outputs:
 
@@ -61,7 +61,7 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
         in multiples of threshold exceedances, i.e., a value of 1 indicates the MHW
         intensity (relative to the climatology) was >=1 times the value of the threshold (but
         less than 2 times; relative to climatology, i.e., threshold - climatology).
-        Category types are defined as 1=strong, 2=moderate, 3=severe, 4=extreme. More details in
+        Category types are defined as 1=moderate, 2=strong, 3=severe, 4=extreme. More details in
         Hobday et al. (in prep., Oceanography). Also supplied are the duration of each of these
         categories for each event.
 
@@ -82,11 +82,8 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
                              as list of start and end years. Default is to calculate
                              over the full range of years in the supplied time series.
                              Alternate periods suppled as a list e.g. [1983,2012].
-      pctile                 Threshold percentile (%) for detection of extreme values
-                             (DEFAULT = 90)
-      windowHalfWidth        Width of window (one sided) about day-of-year used for
-                             the pooling of values and calculation of threshold percentile
-                             (DEFAULT = 5 [days])
+      pctile                 Threshold percentile for detection of extreme values
+                             (DEFAULT = 0.9)
       smoothPercentile       Boolean switch indicating whether to smooth the threshold
                              percentile timeseries with a moving average (DEFAULT = True)
       smoothPercentileWidth  Width of moving average window for smoothing threshold
@@ -105,11 +102,8 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
       coldSpells             Specifies if the code should detect cold events instead of
                              heat events. (DEFAULT = False)
       alternateClimatology   Specifies an alternate temperature time series to use for the
-                             calculation of the climatology. Format is as a list of numpy
-                             arrays: (1) the first element of the list is a time vector,
-                             in datetime format (e.g., date(1982,1,1).toordinal())
-                             [1D numpy array of length TClim] and (2) the second element of
-                             the list is a temperature vector [1D numpy array of length TClim].
+                             calculation of the climatology. Format is a 1D xarray data
+                             array with dimensions 'time' of length TClim.
                              (DEFAULT = False)
 
     Notes:
@@ -118,27 +112,29 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
          with few missing values. Time ranges which start and end part-way through the calendar
          year are supported.
 
-      2. This function supports leap years. This is done by ignoring Feb 29s for the initial
-         calculation of the climatology and threshold. The value of these for Feb 29 is then
-         linearly interpolated from the values for Feb 28 and Mar 1.
+      2. This function supports leap years.
 
       3. The calculation of onset and decline rates assumes that the heat wave started a half-day
          before the start day and ended a half-day after the end-day. (This is consistent with the
          duration definition as implemented, which assumes duration = end day - start day + 1.)
 
-      4. For the purposes of MHW detection, any missing temp values not interpolated over (through
-         optional maxPadLLength) will be set equal to the seasonal climatology. This means they will
-         trigger the end/start of any adjacent temp values which satisfy the MHW criteria.
-
-      5. If the code is used to detect cold events (coldSpells = True), then it works just as for heat
+      4. If the code is used to detect cold events (coldSpells = True), then it works just as for heat
          waves except that events are detected as deviations below the (100 - pctile)th percentile
          (e.g., the 10th instead of 90th) for at least 5 days. Intensities are reported as negative
          values and represent the temperature anomaly below climatology.
 
     Written by Eric Oliver, Institue for Marine and Antarctic Studies, University of Tasmania, Feb 2015
+    Edited by Marion Alberty, Princeton University, July 2022
 
     '''
 
+    #
+    # Ensure data array is loaded into memory
+    #
+    
+    temp = temp.load()
+    
+    
     #
     # Initialize MHW output variable
     #
@@ -179,33 +175,8 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
     #
 
     # Generate vectors for year, month, day-of-month, and day-of-year
-    T = len(t)
-    year = np.zeros((T))
-    month = np.zeros((T))
-    day = np.zeros((T))
-    doy = np.zeros((T))
-    for i in range(T):
-        year[i] = date.fromordinal(t[i]).year
-        month[i] = date.fromordinal(t[i]).month
-        day[i] = date.fromordinal(t[i]).day
-    # Leap-year baseline for defining day-of-year values
-    year_leapYear = 2012 # This year was a leap-year and therefore doy in range of 1 to 366
-    t_leapYear = np.arange(date(year_leapYear, 1, 1).toordinal(),date(year_leapYear, 12, 31).toordinal()+1)
-    dates_leapYear = [date.fromordinal(tt.astype(int)) for tt in t_leapYear]
-    month_leapYear = np.zeros((len(t_leapYear)))
-    day_leapYear = np.zeros((len(t_leapYear)))
-    doy_leapYear = np.zeros((len(t_leapYear)))
-    for tt in range(len(t_leapYear)):
-        month_leapYear[tt] = date.fromordinal(t_leapYear[tt]).month
-        day_leapYear[tt] = date.fromordinal(t_leapYear[tt]).day
-        doy_leapYear[tt] = t_leapYear[tt] - date(date.fromordinal(t_leapYear[tt]).year,1,1).toordinal() + 1
-    # Calculate day-of-year values
-    for tt in range(T):
-        doy[tt] = doy_leapYear[(month_leapYear == month[tt]) * (day_leapYear == day[tt])]
-
-    # Constants (doy values for Feb-28 and Feb-29) for handling leap-years
-    feb28 = 59
-    feb29 = 60
+    year = temp['time'].dt.year.values
+    doy = temp['time'].dt.dayofyear.values
 
     # Set climatology period, if unset use full range of available data
     if (climatologyPeriod[0] is None) or (climatologyPeriod[1] is None):
@@ -218,100 +189,56 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
 
     # if alternate temperature time series is supplied for the calculation of the climatology
     if alternateClimatology:
-        tClim = alternateClimatology[0]
-        tempClim = alternateClimatology[1]
-        TClim = len(tClim)
-        yearClim = np.zeros((TClim))
-        monthClim = np.zeros((TClim))
-        dayClim = np.zeros((TClim))
-        doyClim = np.zeros((TClim))
-        for i in range(TClim):
-            yearClim[i] = date.fromordinal(tClim[i]).year
-            monthClim[i] = date.fromordinal(tClim[i]).month
-            dayClim[i] = date.fromordinal(tClim[i]).day
-            doyClim[i] = doy_leapYear[(month_leapYear == monthClim[i]) * (day_leapYear == dayClim[i])]
+        tempClim = alternateClimatology
     else:
         tempClim = temp.copy()
-        TClim = np.array([T]).copy()[0]
-        yearClim = year.copy()
-        monthClim = month.copy()
-        dayClim = day.copy()
-        doyClim = doy.copy()
 
     # Flip temp time series if detecting cold spells
     if coldSpells:
         temp = -1.*temp
         tempClim = -1.*tempClim
+    
+    # Truncate climatology to given period
+    tempClim = tempClim.sel(time=slice(str(climatologyPeriod[0]).zfill(4),str(climatologyPeriod[-1]).zfill(4)))
 
-    # Pad missing values for all consecutive missing blocks of length <= maxPadLength
-    if maxPadLength:
-        temp = pad(temp, maxPadLength=maxPadLength)
-        tempClim = pad(tempClim, maxPadLength=maxPadLength)
-
-    # Length of climatological year
-    lenClimYear = 366
-    # Start and end indices
-    clim_start = np.where(yearClim == climatologyPeriod[0])[0][0]
-    clim_end = np.where(yearClim == climatologyPeriod[1])[0][-1]
     # Inialize arrays
-    thresh_climYear = np.NaN*np.zeros(lenClimYear)
-    seas_climYear = np.NaN*np.zeros(lenClimYear)
     clim = {}
-    clim['thresh'] = np.NaN*np.zeros(TClim)
-    clim['seas'] = np.NaN*np.zeros(TClim)
-    # Loop over all day-of-year values, and calculate threshold and seasonal climatology across years
-    for d in range(1,lenClimYear+1):
-        # Special case for Feb 29
-        if d == feb29:
-            continue
-        # find all indices for each day of the year +/- windowHalfWidth and from them calculate the threshold
-        tt0 = np.where(doyClim[clim_start:clim_end+1] == d)[0] 
-        # If this doy value does not exist (i.e. in 360-day calendars) then skip it
-        if len(tt0) == 0:
-            continue
-        tt = np.array([])
-        for w in range(-windowHalfWidth, windowHalfWidth+1):
-            tt = np.append(tt, clim_start+tt0 + w)
-        tt = tt[tt>=0] # Reject indices "before" the first element
-        tt = tt[tt<TClim] # Reject indices "after" the last element
-        thresh_climYear[d-1] = np.percentile(nonans(tempClim[tt.astype(int)]), pctile)
-        seas_climYear[d-1] = np.mean(nonans(tempClim[tt.astype(int)]))
-    # Special case for Feb 29
-    thresh_climYear[feb29-1] = 0.5*thresh_climYear[feb29-2] + 0.5*thresh_climYear[feb29]
-    seas_climYear[feb29-1] = 0.5*seas_climYear[feb29-2] + 0.5*seas_climYear[feb29]
+    # Calculate threshold and seasonal climatology across years
+    thresh_climYear = tempClim.groupby('time.dayofyear').quantile(pctile)
+    seas_climYear = tempClim.groupby('time.dayofyear').mean()
 
     # Smooth if desired
     if smoothPercentile:
-        # If the climatology contains NaNs, then assume it is a <365-day year and deal accordingly
-        if np.sum(np.isnan(seas_climYear)) + np.sum(np.isnan(thresh_climYear)):
-            valid = ~np.isnan(thresh_climYear)
-            thresh_climYear[valid] = runavg(thresh_climYear[valid], smoothPercentileWidth)
-            valid = ~np.isnan(seas_climYear)
-            seas_climYear[valid] = runavg(seas_climYear[valid], smoothPercentileWidth)
-        # >= 365-day year
-        else:
-            thresh_climYear = runavg(thresh_climYear, smoothPercentileWidth)
-            seas_climYear = runavg(seas_climYear, smoothPercentileWidth)
-
+        # Get half width for padding
+        padwidth = math.floor(smoothPercentileWidth/2)
+        # Make window odd for centering the rolling average
+        smoothPercentileWidth = padwidth * 2 + 1
+        thresh_climYear = thresh_climYear.pad(dayofyear=padwidth,mode="wrap").rolling(dayofyear=smoothPercentileWidth,center=True).mean().dropna("dayofyear")
+        seas_climYear = seas_climYear.pad(dayofyear=padwidth,mode="wrap").rolling(dayofyear=smoothPercentileWidth,center=True).mean().dropna("dayofyear")
+    
     # Generate threshold for full time series
-    clim['thresh'] = thresh_climYear[doy.astype(int)-1]
-    clim['seas'] = seas_climYear[doy.astype(int)-1]
+    clim['thresh'] = thresh_climYear.values[doy.astype(int)-1]
+    clim['seas'] = seas_climYear.values[doy.astype(int)-1]
 
     # Save vector indicating which points in temp are missing values
-    clim['missing'] = np.isnan(temp)
-    # Set all remaining missing temp values equal to the climatology
-    temp[np.isnan(temp)] = clim['seas'][np.isnan(temp)]
+    clim['missing'] = np.isnan(temp.values)
 
     #
     # Find MHWs as exceedances above the threshold
     #
 
     # Time series of "True" when threshold is exceeded, "False" otherwise
-    exceed_bool = temp - clim['thresh']
+    exceed_bool = temp.values - clim['thresh']
     exceed_bool[exceed_bool<=0] = False
     exceed_bool[exceed_bool>0] = True
+    # Fix issue where missing temp vaues (nan) are counted as True
+    exceed_bool[np.isnan(exceed_bool)] = False
     # Find contiguous regions of exceed_bool = True
     events, n_events = ndimage.label(exceed_bool)
+    
+    # Make datenum array
+    t = cftime.date2num(temp['time'].values,units='days since 0001-01-01-12:00:00')
+    T = len(t)
 
     # Find all MHW events of duration >= minDuration
     for ev in range(1,n_events+1):
@@ -343,14 +270,14 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
     mhw['n_events'] = len(mhw['time_start'])
     categories = np.array(['Moderate', 'Strong', 'Severe', 'Extreme'])
     for ev in range(mhw['n_events']):
-        mhw['date_start'].append(date.fromordinal(mhw['time_start'][ev]))
-        mhw['date_end'].append(date.fromordinal(mhw['time_end'][ev]))
+        mhw['date_start'].append(temp['time'].values[np.where(t == mhw['time_start'][ev])][0])
+        mhw['date_end'].append(temp['time'].values[np.where(t == mhw['time_end'][ev])][0])
         # Get SST series during MHW event, relative to both threshold and to seasonal climatology
         tt_start = np.where(t==mhw['time_start'][ev])[0][0]
         tt_end = np.where(t==mhw['time_end'][ev])[0][0]
         mhw['index_start'].append(tt_start)
         mhw['index_end'].append(tt_end)
-        temp_mhw = temp[tt_start:tt_end+1]
+        temp_mhw = temp.values[tt_start:tt_end+1]
         thresh_mhw = clim['thresh'][tt_start:tt_end+1]
         seas_mhw = clim['seas'][tt_start:tt_end+1]
         mhw_relSeas = temp_mhw - seas_mhw
@@ -360,7 +287,7 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
         # Find peak
         tt_peak = np.argmax(mhw_relSeas)
         mhw['time_peak'].append(mhw['time_start'][ev] + tt_peak)
-        mhw['date_peak'].append(date.fromordinal(mhw['time_start'][ev] + tt_peak))
+        mhw['date_peak'].append(temp['time'].values[np.where(t == mhw['time_peak'][ev])][0])
         mhw['index_peak'].append(tt_start + tt_peak)
         # MHW Duration
         mhw['duration'].append(len(mhw_relSeas))
@@ -385,11 +312,11 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
         mhw['duration_strong'].append(np.sum(cats == 2.))
         mhw['duration_severe'].append(np.sum(cats == 3.))
         mhw['duration_extreme'].append(np.sum(cats >= 4.))
-        
+
         # Rates of onset and decline
         # Requires getting MHW strength at "start" and "end" of event (continuous: assume start/end half-day before/after first/last point)
         if tt_start > 0:
-            mhw_relSeas_start = 0.5*(mhw_relSeas[0] + temp[tt_start-1] - clim['seas'][tt_start-1])
+            mhw_relSeas_start = 0.5*(mhw_relSeas[0] + temp.values[tt_start-1] - clim['seas'][tt_start-1])
             mhw['rate_onset'].append((mhw_relSeas[tt_peak] - mhw_relSeas_start) / (tt_peak+0.5))
         else: # MHW starts at beginning of time series
             if tt_peak == 0: # Peak is also at begining of time series, assume onset time = 1 day
@@ -397,7 +324,7 @@ def detect(t, temp, climatologyPeriod=[None,None], pctile=90, windowHalfWidth=5,
             else:
                 mhw['rate_onset'].append((mhw_relSeas[tt_peak] - mhw_relSeas[0]) / tt_peak)
         if tt_end < T-1:
-            mhw_relSeas_end = 0.5*(mhw_relSeas[-1] + temp[tt_end+1] - clim['seas'][tt_end+1])
+            mhw_relSeas_end = 0.5*(mhw_relSeas[-1] + temp.values[tt_end+1] - clim['seas'][tt_end+1])
             mhw['rate_decline'].append((mhw_relSeas[tt_peak] - mhw_relSeas_end) / (tt_end-tt_start-tt_peak+0.5))
         else: # MHW finishes at end of time series
             if tt_peak == T-1: # Peak is also at end of time series, assume decline time = 1 day
@@ -848,67 +775,6 @@ def rank(t, mhw):
 
     # Return rank, return
     return rank, returnPeriod
-
-
-def runavg(ts, w):
-    '''
-
-    Performs a running average of an input time series using uniform window
-    of width w. This function assumes that the input time series is periodic.
-
-    Inputs:
-
-      ts            Time series [1D numpy array]
-      w             Integer length (must be odd) of running average window
-
-    Outputs:
-
-      ts_smooth     Smoothed time series
-
-    Written by Eric Oliver, Institue for Marine and Antarctic Studies, University of Tasmania, Feb-Mar 2015
-
-    '''
-    # Original length of ts
-    N = len(ts)
-    # make ts three-fold periodic
-    ts = np.append(ts, np.append(ts, ts))
-    # smooth by convolution with a window of equal weights
-    ts_smooth = np.convolve(ts, np.ones(w)/w, mode='same')
-    # Only output central section, of length equal to the original length of ts
-    ts = ts_smooth[N:2*N]
-
-    return ts
-
-
-def pad(data, maxPadLength=False):
-    '''
-
-    Linearly interpolate over missing data (NaNs) in a time series.
-
-    Inputs:
-
-      data	     Time series [1D numpy array]
-      maxPadLength   Specifies the maximum length over which to interpolate,
-                     i.e., any consecutive blocks of NaNs with length greater
-                     than maxPadLength will be left as NaN. Set as an integer.
-                     maxPadLength=False (default) interpolates over all NaNs.
-
-    Written by Eric Oliver, Institue for Marine and Antarctic Studies, University of Tasmania, Jun 2015
-
-    '''
-    data_padded = data.copy()
-    bad_indexes = np.isnan(data)
-    good_indexes = np.logical_not(bad_indexes)
-    good_data = data[good_indexes]
-    interpolated = np.interp(bad_indexes.nonzero()[0], good_indexes.nonzero()[0], good_data)
-    data_padded[bad_indexes] = interpolated
-    if maxPadLength:
-        blocks, n_blocks = ndimage.label(np.isnan(data))
-        for bl in range(1, n_blocks+1):
-            if (blocks==bl).sum() > maxPadLength:
-                data_padded[blocks==bl] = np.nan
-
-    return data_padded
 
 
 def nonans(array):
